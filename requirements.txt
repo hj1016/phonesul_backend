@@ -1,0 +1,4 @@
+# 폰술 건배방 서버 — 1차 골격 의존성 (context §4: FastAPI + WebSocket)
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+# websockets / wsproto 등 wss 런타임은 uvicorn[standard]에 포함됨.
