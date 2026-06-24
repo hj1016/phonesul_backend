@@ -8,7 +8,7 @@ import pytest
 from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
-from app.main import app, manager, rooms
+from app.main import app, manager
 
 
 def _create(client: TestClient) -> tuple[str, str]:
@@ -33,7 +33,7 @@ def test_capacity_rejects_over_limit(monkeypatch):
                 ws_over.receive_json()
 
 
-def test_no_socket_leak_after_host_close():
+def test_no_socket_leak_after_host_close(redis_sync):
     """방장 종료 후 ConnectionManager 내부에 방·소켓 잔여 없음(누수 방지)."""
     client = TestClient(app)
     code, token = _create(client)
@@ -45,7 +45,7 @@ def test_no_socket_leak_after_host_close():
         assert manager.room_size(code) == 0
         assert code not in manager._rooms
         assert all(rc != code for rc, _mid in manager._sockets.values())
-        assert rooms.get(code) is None
+        assert redis_sync.exists("room:" + code) == 0  # Redis 방 키도 폐기
 
 
 def test_repeated_reconnect_no_leak():

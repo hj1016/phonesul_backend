@@ -2,3 +2,5 @@
 fastapi==0.115.6
 uvicorn[standard]==0.34.0
 # websockets / wsproto 등 wss 런타임은 uvicorn[standard]에 포함됨.
+# 상태 저장소: Redis(재시작 내구성 + 유휴/retired TTL). 단일 박스, pub/sub 미사용(범위 밖).
+redis==5.2.1

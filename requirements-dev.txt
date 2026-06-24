@@ -1,4 +1,6 @@
 # 개발·테스트 전용 의존성 (운영 배포엔 미포함)
 -r requirements.txt
 pytest==8.3.4
-httpx==0.28.1   # FastAPI TestClient 의존
+pytest-asyncio==0.24.0   # async RoomStore 단위 테스트
+httpx==0.28.1            # FastAPI TestClient 의존
+fakeredis==2.26.2        # 인메모리 Redis 모킹 — 자동 테스트는 Redis 서버 없이 통과

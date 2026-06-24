@@ -112,3 +112,40 @@ def test_different_members_cheer_simultaneously():
         ws2.send_json({"type": "cheers"})       # 다른 멤버 → 통과
         assert ws1.receive_json()["type"] == "cheers"
         assert ws2.receive_json()["type"] == "cheers"
+
+
+# ---- 핫패스 점검: 짠 경로에 Redis 상태 I/O가 없음(구조적 확인) ----
+
+def test_cheers_hot_path_has_no_redis_state_io(monkeypatch):
+    """짠 처리 동안 Redis 상태 읽기/쓰기(get/set/delete/exists/hgetall/scan)가 일어나지
+
+    않음을 구조적으로 확인한다. 유일하게 허용되는 Redis 접촉은 가벼운 TTL 슬라이딩
+    (touch=pexpire)뿐 — 방/멤버 상태는 핫패스에서 건드리지 않는다(context §6, 비게임·
+    저장 안 함). pexpire는 일부러 감시하지 않는다(허용된 단일 경량 연산).
+    """
+    import app.main as main
+
+    client = TestClient(app)
+    code = _new_room(client)
+
+    state_ops: list[str] = []
+    redis = main.rooms._r
+    for name in ("get", "set", "delete", "exists", "hgetall", "hset", "mget"):
+        original = getattr(redis, name, None)
+        if original is None:
+            continue
+
+        async def spy(*args, _n=name, _o=original, **kwargs):
+            state_ops.append(_n)
+            return await _o(*args, **kwargs)
+
+        monkeypatch.setattr(redis, name, spy)
+
+    with client.websocket_connect(f"/ws/{code}") as ws:
+        ws.receive_json()       # 입장 roster (connect 단계의 get/set은 여기까지)
+        state_ops.clear()       # 짠 처리만 따로 관측
+        ws.send_json({"type": "cheers"})
+        assert ws.receive_json()["type"] == "cheers"
+
+    # 짠 처리 동안 상태 I/O 0건 — TTL 슬라이딩(pexpire)만 발생.
+    assert state_ops == []
