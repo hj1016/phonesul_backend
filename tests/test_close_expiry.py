@@ -69,6 +69,54 @@ def test_closed_code_is_retired_and_not_reused(monkeypatch):
     assert new_room.code == "ABC234"
 
 
+# ---- F-RT-06: 방장 명시적 '나가기'(leave) → 방 종료 ----
+
+def test_host_leave_message_terminates_room():
+    client = TestClient(app)
+    code, token = _create(client)
+    # 방장이 host_token으로 연결 → 나가기(leave) 전송 → 방 전원 종료.
+    with client.websocket_connect(f"/ws/{code}?host_token={token}") as ws:
+        ws.receive_json()  # 최초 roster
+        ws.send_json({"type": "leave"})
+        msg = ws.receive_json()
+        assert msg["type"] == "room_closed"
+        assert msg["reason"] == "host_ended"
+        with pytest.raises(WebSocketDisconnect):
+            ws.receive_json()
+    # 방 폐기 + 코드 재사용 금지 확인.
+    assert rooms.get(code) is None
+    assert rooms.is_retired(code) is True
+
+
+def test_member_leave_does_not_terminate_room():
+    client = TestClient(app)
+    code, token = _create(client)
+    # 방장(host_token) + 일반 멤버(토큰 없음) 동시 입장.
+    with client.websocket_connect(f"/ws/{code}?host_token={token}") as host:
+        host.receive_json()  # roster count=1
+        with client.websocket_connect(f"/ws/{code}") as guest:
+            host.receive_json()   # roster count=2 (guest 입장 브로드캐스트)
+            guest.receive_json()  # roster count=2 (guest 자신)
+            # 일반 멤버 leave는 본인만 퇴장 — 방은 유지(현행 유지).
+            guest.send_json({"type": "leave"})
+        # guest 소켓 종료 후 host는 인원 감소 roster를 받는다.
+        roster = host.receive_json()
+        assert roster["type"] == "roster"
+        assert roster["count"] == 1
+    # 방은 여전히 살아있음(방장 leave가 아니므로 종료 안 됨).
+    assert rooms.get(code) is not None
+
+
+def test_non_host_token_does_not_grant_host_leave():
+    client = TestClient(app)
+    code, _token = _create(client)
+    # 틀린 host_token으로 연결한 참여자의 leave는 방을 종료하지 못한다.
+    with client.websocket_connect(f"/ws/{code}?host_token=wrong") as ws:
+        ws.receive_json()  # roster
+        ws.send_json({"type": "leave"})
+    assert rooms.get(code) is not None
+
+
 # ---- F-RT-06: 유휴 만료(백그라운드 sweep) ----
 
 def test_idle_expiry_terminates_room(monkeypatch):

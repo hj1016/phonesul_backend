@@ -53,6 +53,9 @@ class Member:
     # 마지막 짠 시각 — 멤버별 연타 쿨다운 판정용. 짠 "횟수"는 저장하지 않는다
     # (비게임: 누가 몇 번 짠 집계 금지, context §6). 시각만 보관해 디바운스에 사용.
     last_cheers_at: datetime | None = None
+    # 방장 여부 — wss 연결 시 host_token 일치로 판정(F-RT-06 명시적 종료 구분용).
+    # 방장의 명시적 leave는 방 전원 종료, 일반 멤버 leave는 본인만 퇴장.
+    is_host: bool = False
 
 
 def cheers_allowed(member: Member, now: datetime) -> bool:

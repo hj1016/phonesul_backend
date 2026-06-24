@@ -186,7 +186,17 @@ async def ws_endpoint(websocket: WebSocket, room_code: str) -> None:
 
     # 5) 멤버 등록(익명 식별자만, platform §3). 성공 시 시도 기록 해제.
     limiter.reset(client_key)
-    member = Member(member_id=generate_member_id(), socket_id=generate_member_id())
+    # 방장 식별: 연결 시 host_token 쿼리 파라미터가 방 토큰과 일치하면 방장 소켓.
+    # REVIEW(host_token URL 노출): 쿼리 파라미터는 wss(TLS)로 전송 중엔 암호화되나
+    # 서버/프록시 접근 로그·브라우저 히스토리에 남을 수 있음. 운영 로그 토큰 마스킹
+    # 또는 연결 후 첫 메시지 인증으로의 전환을 운영자와 확인(platform §3 인증/식별).
+    host_token = websocket.query_params.get("host_token")
+    is_host = bool(host_token) and host_token == room.host_token
+    member = Member(
+        member_id=generate_member_id(),
+        socket_id=generate_member_id(),
+        is_host=is_host,
+    )
     room.members.append(member)
     room.touch()
     await manager.register(room_code, websocket, member.member_id)
@@ -194,40 +204,74 @@ async def ws_endpoint(websocket: WebSocket, room_code: str) -> None:
     await _broadcast_roster(room)
 
     # 6) 메시지 수신 루프. 끊김/종료 시 멤버 제거 후 roster 갱신.
+    #    _dispatch가 False를 반환하면(방장 leave로 방이 종료되어 이 소켓도 닫힘) 루프 종료.
+    closed = False
     try:
         while True:
             raw = await websocket.receive_text()
-            await _dispatch(room, member, websocket, raw)
+            if not await _dispatch(room, member, websocket, raw):
+                closed = True
+                break
     except WebSocketDisconnect:
         logger.info("ws disconnect room=%s member=%s", room_code, member.member_id)
     finally:
         manager.unregister(websocket)
-        _remove_member(room, member.member_id)
-        room.touch()
-        await _broadcast_roster(room)
+        # 방장 leave로 이미 방 전체가 종료된 경우 멤버·roster 정리는 _terminate_room이
+        # 수행했으므로 중복 처리하지 않는다(빈 방에 roster 재전송 방지).
+        if not closed:
+            _remove_member(room, member.member_id)
+            room.touch()
+            await _broadcast_roster(room)
 
 
 async def _dispatch(
     room: Room, member: Member, websocket: WebSocket, raw: str
-) -> None:
-    """수신 JSON을 타입별로 분기(context §4). cheers는 후속 STEP."""
+) -> bool:
+    """수신 JSON을 타입별로 분기(context §4).
+
+    반환값은 연결 유지 여부 — False면 이 소켓이 닫혔으니(방장 leave로 방 종료) 수신
+    루프를 끝내야 함을 호출부에 알린다. 그 외에는 True(연결 유지).
+    """
     try:
         msg = json.loads(raw)
     except json.JSONDecodeError:
         await websocket.send_json(messages.error("bad_json", "메시지 형식이 올바르지 않아요."))
-        return
+        return True
 
     msg_type = msg.get("type")
     if msg_type not in messages.CLIENT_TYPES:
         await websocket.send_json(messages.error("unknown_type", "지원하지 않는 요청이에요."))
-        return
+        return True
 
     if msg_type == messages.TYPE_CHEERS:
         await _handle_cheers(room, member)
-        return
+        return True
 
-    # leave는 소켓 종료(disconnect)로 처리되므로 별도 동작 없음.
+    if msg_type == messages.TYPE_LEAVE:
+        return await _handle_leave(room, member)
+
+    # join은 연결 수립 시 이미 처리됨(연결=참여) — 별도 동작 없음.
     logger.info("ws msg room=%s member=%s type=%s (no-op)", room.code, member.member_id, msg_type)
+    return True
+
+
+async def _handle_leave(room: Room, member: Member) -> bool:
+    """명시적 '나가기'(F-RT-04/06). 반환값은 연결 유지 여부.
+
+    방장이 나가기를 누르면(의도적 행동) 방을 종료해 전원 폐기한다(host_ended). 이때
+    방장 소켓도 함께 닫히므로 False를 반환해 수신 루프를 끝낸다. 이는 우발적 소켓
+    끊김(백그라운드)과 구분된다 — 끊김은 현행대로 방을 유지하고 유휴 만료에 위임하되
+    (현행 유지 결정), 명시적 leave만 종료로 처리한다.
+
+    일반 멤버의 leave는 본인만 퇴장 — 클라이언트의 소켓 종료가 수신 루프 finally에서
+    멤버 제거·roster 갱신을 일으키므로 서버 측 추가 동작은 없다(현행 유지, True 반환).
+    """
+    if member.is_host:
+        logger.info("ws leave (host) room=%s member=%s", room.code, member.member_id)
+        await _terminate_room(room, "host_ended")
+        return False
+    logger.info("ws leave (member) room=%s member=%s", room.code, member.member_id)
+    return True
 
 
 async def _handle_cheers(room: Room, member: Member) -> None:
