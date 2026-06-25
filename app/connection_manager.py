@@ -10,6 +10,7 @@ ASSUMPTION: 단일 인스턴스 가정 — 다중 인스턴스 확장(Redis pub/
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Any
 
@@ -61,20 +62,50 @@ class ConnectionManager:
         return entry
 
     async def broadcast(self, room_code: str, payload: dict[str, Any]) -> None:
-        """같은 방 전원에게 1회씩 전송(context §4.1 원자성).
+        """같은 방 전원에게 1회씩 **동시** 전송(context §4.1 원자성).
 
-        끊긴 소켓 전송 실패는 개별 흡수해 한 명의 실패가 전체 broadcast를 막지 않게
-        한다. 실패 소켓 정리는 호출부의 disconnect 흐름에 맡긴다.
+        asyncio.gather로 동시에 보내, 수신 느린 한 클라이언트가 같은 방 전체 전송을
+        지연시키지 않게 한다(단일 박스 피크 부하 튜닝). 개별 소켓 전송 실패는 각자
+        흡수해 한 명의 실패가 전체 broadcast를 막지 않게 한다 — 실패 소켓 정리는
+        호출부의 disconnect 흐름에 맡긴다.
         """
-        for websocket in list(self._rooms.get(room_code, ())):
-            try:
-                await websocket.send_json(payload)
-            except Exception:  # noqa: BLE001 - 개별 소켓 전송 실패 흡수
-                logger.warning("broadcast send failed room=%s", room_code)
+        sockets = list(self._rooms.get(room_code, ()))
+        if not sockets:
+            return
+        await asyncio.gather(*(self._send_one(ws, payload, room_code) for ws in sockets))
+
+    async def _send_one(
+        self, websocket: WebSocket, payload: dict[str, Any], room_code: str
+    ) -> None:
+        try:
+            await websocket.send_json(payload)
+        except Exception:  # noqa: BLE001 - 개별 소켓 전송 실패 흡수
+            logger.warning("broadcast send failed room=%s", room_code)
 
     def sockets_in(self, room_code: str) -> list[WebSocket]:
         """방의 현재 소켓 목록 사본(방 종료 시 일괄 close용)."""
         return list(self._rooms.get(room_code, ()))
 
+    def members_in(self, room_code: str) -> list[str]:
+        """방의 현재 멤버 식별자 목록 — roster 진실 원천(살아있는 소켓 기준).
+
+        멤버 목록은 영속 저장하지 않는다(platform §3). 연결된 소켓 매핑에서 직접
+        재구성하므로 프로세스 재시작·재접속(F-RT-07) 후에도 실제 연결 상태와 일치한다.
+        """
+        members: list[str] = []
+        for ws in self._rooms.get(room_code, ()):
+            entry = self._sockets.get(ws)
+            if entry is not None:
+                members.append(entry[1])
+        return members
+
     def room_size(self, room_code: str) -> int:
         return len(self._rooms.get(room_code, ()))
+
+    def total_connections(self) -> int:
+        """현재 등록된 전체 소켓 수(운영 모니터링용)."""
+        return len(self._sockets)
+
+    def room_count(self) -> int:
+        """현재 로컬 소켓을 가진 활성 방 수(운영 모니터링용)."""
+        return len(self._rooms)

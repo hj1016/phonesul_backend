@@ -42,8 +42,31 @@ limiter = AttemptLimiter()
 WS_POLICY_VIOLATION = 1008
 WS_GOING_AWAY = 1001
 
-# ASSUMPTION: 유휴 만료 sweep 주기(초) — 임의값(context §3·§8). 단일 인스턴스 백그라운드.
-SWEEP_INTERVAL_SECONDS = 30
+# ASSUMPTION: 모니터 샘플링 주기(초) — 임의값. 가벼운 수준의 주기 로깅·지표 갱신.
+MONITOR_INTERVAL_SECONDS = 30
+
+# 최근 모니터 샘플(가벼운 지표). 단일 박스의 진짜 한계는 메모리가 아니라 피크 시 이벤트
+# 루프 밀림이므로, "B(다중 인스턴스)로 넘어갈 시점"을 데이터로 판단할 근거를 남긴다.
+_last_monitor: dict[str, float | int] = {"loop_lag_ms": 0.0, "connections": 0, "rooms": 0}
+
+
+async def _monitor_loop() -> None:
+    """이벤트 루프 밀림(lag)과 동시 연결 수를 주기적으로 샘플링·로깅(가벼운 형태).
+
+    sleep(interval)이 예상보다 늦게 깬 만큼이 루프 밀림이다 — 핸들러가 루프를 오래
+    점유할수록 커진다. 과설계 금지: 외부 의존성·고해상도 히스토그램 없이 단일 샘플만.
+    """
+    loop = asyncio.get_running_loop()
+    while True:
+        start = loop.time()
+        await asyncio.sleep(MONITOR_INTERVAL_SECONDS)
+        lag_ms = max(0.0, (loop.time() - start - MONITOR_INTERVAL_SECONDS) * 1000)
+        conns = manager.total_connections()
+        rooms_n = manager.room_count()
+        _last_monitor.update(loop_lag_ms=round(lag_ms, 1), connections=conns, rooms=rooms_n)
+        logger.info(
+            "monitor loop_lag_ms=%.1f connections=%d rooms=%d", lag_ms, conns, rooms_n
+        )
 
 
 async def _terminate_room(room: Room, reason: str) -> None:
@@ -56,40 +79,26 @@ async def _terminate_room(room: Room, reason: str) -> None:
         with contextlib.suppress(Exception):
             await ws.close(code=WS_GOING_AWAY)
         manager.unregister(ws)
-    room.members.clear()
-    rooms.close(room.code)  # remove + 코드 retire(재사용 금지)
+    await rooms.close(room.code)  # remove + 코드 retire(재사용 금지)
     logger.info("room terminated code=%s reason=%s", room.code, reason)
-
-
-async def _sweep_once() -> None:
-    """만료된 방을 모두 종료(F-RT-06). 백그라운드 루프와 테스트가 직접 호출."""
-    for room in rooms.expired_rooms():
-        await _terminate_room(room, "expired")
-
-
-async def _expiry_loop() -> None:
-    """유휴 만료 방을 주기적으로 정리하는 백그라운드 태스크.
-
-    ASSUMPTION: 단일 인스턴스 가정 — 다중 인스턴스 확장(Redis pub/sub)은 범위 외
-    (context §4·§8). 다중 인스턴스에서는 방 소유/만료를 공유 저장소로 조율해야 함.
-    """
-    while True:
-        await asyncio.sleep(SWEEP_INTERVAL_SECONDS)
-        try:
-            await _sweep_once()
-        except Exception:  # noqa: BLE001 - 스윕 실패가 루프를 죽이지 않게
-            logger.exception("expiry sweep failed")
 
 
 @contextlib.asynccontextmanager
 async def lifespan(app: FastAPI):
-    task = asyncio.create_task(_expiry_loop())
+    """앱 수명주기. 유휴 만료는 Redis 키 TTL이 처리하므로 만료 sweep은 없다.
+
+    시작 시 가벼운 모니터 루프(루프 밀림·연결 수)를 띄우고, 종료 시 이를 정리한 뒤
+    Redis 연결 풀을 닫는다(생성은 RoomStore가 첫 명령 때 지연 수행). 단일 박스 —
+    소켓은 프로세스 로컬(ConnectionManager).
+    """
+    monitor = asyncio.create_task(_monitor_loop())
     try:
         yield
     finally:
-        task.cancel()
+        monitor.cancel()
         with contextlib.suppress(asyncio.CancelledError):
-            await task
+            await monitor
+        await rooms.aclose()
 
 
 app = FastAPI(title="phonesul-server", version="0.1.0", lifespan=lifespan)
@@ -112,6 +121,22 @@ async def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
+@app.get("/metrics")
+async def metrics() -> dict[str, float | int]:
+    """가벼운 운영 지표 — 단일 박스 한계 판단 근거(과설계 금지).
+
+    동시 연결 수·활성 방 수·최근 이벤트 루프 밀림(ms)만 노출한다. 단일 박스의 진짜
+    한계는 메모리가 아니라 피크 시 루프 밀림이므로, "B(다중 인스턴스)로 넘어갈 시점"을
+    데이터로 판단하기 위함(context §4·§8). 개인정보·짠 집계는 노출하지 않는다(platform
+    §3·context §6 — 운영 카운터일 뿐 비게임 지표 아님).
+    """
+    return {
+        "connections": manager.total_connections(),
+        "rooms": manager.room_count(),
+        "loop_lag_ms": _last_monitor["loop_lag_ms"],
+    }
+
+
 @app.post("/rooms", status_code=201)
 async def create_room() -> dict[str, str]:
     """방 생성 (F-RT-01).
@@ -120,7 +145,7 @@ async def create_room() -> dict[str, str]:
     REVIEW(로그인 강제 여부): 방장 토큰만으로 권한 구분, 토스 로그인 비강제(platform §3).
     hostToken은 생성자에게만 1회 반환. 서버는 영속 저장 안 함(휘발, platform §3).
     """
-    room = rooms.create_room()
+    room = await rooms.create_room()
     return {"code": room.code, "hostToken": room.host_token}
 
 
@@ -133,7 +158,7 @@ async def close_room(
     방장 토큰(X-Host-Token) 검증 후 방·멤버·소켓 폐기. 코드는 재사용 금지.
     토큰 불일치는 404로 응답(방 존재 여부 노출 최소화). 폐기 후 같은 코드 입장 불가.
     """
-    room = rooms.get(room_code)
+    room = await rooms.get(room_code)
     # 방 없음 / 토큰 불일치를 동일 404로 처리 — 방 존재·토큰 추측 단서 최소화.
     if room is None or x_host_token != room.host_token:
         raise HTTPException(status_code=404, detail="방을 찾을 수 없어요.")
@@ -173,14 +198,14 @@ async def ws_endpoint(websocket: WebSocket, room_code: str) -> None:
         return
 
     # 3) 코드 검증 — 없음/만료는 실패 기록 후 거절.
-    room = rooms.get(room_code)
-    if room is None or rooms.is_expired(room):
+    room = await rooms.get(room_code)
+    if room is None or await rooms.is_expired(room):
         limiter.record_failure(client_key)
         await _reject(websocket, "invalid_code", "방을 찾을 수 없어요.")
         return
 
-    # 4) 정원 검사.
-    if len(room.members) >= MAX_MEMBERS_PER_ROOM:
+    # 4) 정원 검사 — 현재 연결된 소켓 수 기준(roster 진실 원천 = ConnectionManager).
+    if manager.room_size(room_code) >= MAX_MEMBERS_PER_ROOM:
         await _reject(websocket, "room_full", "방 인원이 가득 찼어요.")
         return
 
@@ -197,11 +222,12 @@ async def ws_endpoint(websocket: WebSocket, room_code: str) -> None:
         socket_id=generate_member_id(),
         is_host=is_host,
     )
-    room.members.append(member)
-    room.touch()
+    # 멤버십은 ConnectionManager(살아있는 소켓)가 보유 — Room에는 저장하지 않는다
+    # (platform §3 휘발, 재접속으로 재구성). roster·정원도 여기서 파생.
+    await rooms.touch(room.code)  # 활동 → Redis 키 TTL 슬라이딩(models.Room.touch 대체)
     await manager.register(room_code, websocket, member.member_id)
     logger.info("ws join room=%s member=%s", room_code, member.member_id)
-    await _broadcast_roster(room)
+    await _broadcast_roster(room.code)
 
     # 6) 메시지 수신 루프. 끊김/종료 시 멤버 제거 후 roster 갱신.
     #    _dispatch가 False를 반환하면(방장 leave로 방이 종료되어 이 소켓도 닫힘) 루프 종료.
@@ -216,12 +242,11 @@ async def ws_endpoint(websocket: WebSocket, room_code: str) -> None:
         logger.info("ws disconnect room=%s member=%s", room_code, member.member_id)
     finally:
         manager.unregister(websocket)
-        # 방장 leave로 이미 방 전체가 종료된 경우 멤버·roster 정리는 _terminate_room이
+        # 방장 leave로 이미 방 전체가 종료된 경우 roster 정리는 _terminate_room이
         # 수행했으므로 중복 처리하지 않는다(빈 방에 roster 재전송 방지).
         if not closed:
-            _remove_member(room, member.member_id)
-            room.touch()
-            await _broadcast_roster(room)
+            await rooms.touch(room.code)  # 활동 → Redis 키 TTL 슬라이딩
+            await _broadcast_roster(room.code)
 
 
 async def _dispatch(
@@ -285,21 +310,20 @@ async def _handle_cheers(room: Room, member: Member) -> None:
     if not cheers_allowed(member, now):
         return
     member.last_cheers_at = now
-    room.touch()
+    await rooms.touch(room.code)  # 활동 → Redis 키 TTL 슬라이딩(값 재기록 없는 PEXPIRE)
     # broadcast 봉투에 sender/count 없음 — "누가 먼저/많이"가 구조적으로 불가능.
     await manager.broadcast(room.code, messages.cheers(room.code))
 
 
-async def _broadcast_roster(room: Room) -> None:
-    """현재 인원 목록을 방 전원에게 동기화(F-RT-04)."""
-    member_ids = [m.member_id for m in room.members]
+async def _broadcast_roster(room_code: str) -> None:
+    """현재 인원 목록을 방 전원에게 동기화(F-RT-04).
+
+    진실 원천은 ConnectionManager(살아있는 소켓) — 재접속 후에도 실제 연결과 일치.
+    """
+    member_ids = manager.members_in(room_code)
     await manager.broadcast(
-        room.code, messages.roster(room.code, len(member_ids), member_ids)
+        room_code, messages.roster(room_code, len(member_ids), member_ids)
     )
-
-
-def _remove_member(room: Room, member_id: str) -> None:
-    room.members[:] = [m for m in room.members if m.member_id != member_id]
 
 
 async def _reject(websocket: WebSocket, code: str, message: str) -> None:

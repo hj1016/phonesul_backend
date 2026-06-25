@@ -165,10 +165,57 @@ REVIEW(백그라운드 소켓 처리), REVIEW(wss) → 실기기·사람.
 
 ---
 
-## 누적 상태 (2026-06-23 기준)
+## STEP 8 — 운영 내구성 보강 (Redis 상태 저장소 + 단일 박스 튜닝)
 
-- **구현 완료(1차 범위):** F-RT-01·03·04·05·06 필수 + F-RT-07 기본.
-- **테스트:** 43 passed (단위·통합·안정성). 로컬 실행·기동 검증 완료.
-- **미해소(머지·배포 금지):** 모든 검수 마커가 `ai:` 커밋 상태로 사람 검수(S4) 전.
-  특히 실기기 의존 4항목(Origin·지연·백그라운드·wss 재확인)은 S3 완전 통과 전제.
+**프롬프트(요약):** 기능 추가가 아니라 운영 내구성. 확정 결정 (A) RoomStore를 in-memory
+→ Redis로 교체(재시작 내구성, 유휴·retired를 TTL로 자동화). (B) 다중 인스턴스+pub/sub·
+Limiter 공유는 범위 밖. 단일 박스 유지. 작업 단위로: ①RoomStore Redis화(인터페이스 유지,
+async) ②main.py 정리(await 전환·sweep 제거·lifespan을 Redis 풀 정리로) ③단일 박스 튜닝
+(broadcast 병렬화·uvloop·FD 상한·가벼운 루프 지연 모니터링) ④의존성·설정 ⑤테스트(회귀 무손상).
+
+**응답(한 일):**
+- **RoomStore(Redis, async):** `redis.asyncio`, 접속은 `REDIS_URL`(기본 redis://localhost:6379/0).
+  키 `room:{code}`(JSON: code·host_token·created_at, SET ex=유휴TTL) / `retired:{code}`(TTL 24h).
+  `get`은 키 부재면 None(만료=TTL 소멸). `touch`는 값 재기록 없이 `PEXPIRE`로 TTL만 슬라이딩.
+  `is_expired`는 "키 부재"로 단순화(now 인자는 시그니처 호환 위해 유지·무시). 인터페이스 보존.
+- **main.py 정리:** RoomStore 호출부 전부 `await`. 유휴 sweep(`_sweep_once`·`_expiry_loop`·
+  `SWEEP_INTERVAL`) 삭제 → TTL이 대체. `lifespan`은 모니터 태스크 기동 + 종료 시 Redis 풀
+  `aclose`. 활동 시 `room.touch()` → `await rooms.touch(code)`로 일관화.
+- **roster 진실 원천 이전:** async `get`이 매 연결 새 Room을 반환해 `Room.members`가
+  연결별로 분리되는 문제 → roster·정원을 `ConnectionManager`(살아있는 소켓)에서 파생하도록
+  `members_in` 추가·전환(설계 원칙 "멤버 미저장→재접속 재구성"과 정합).
+- **단일 박스 튜닝:** `broadcast` 순차 await → `asyncio.gather` 동시 전송(개별 실패 흡수 유지).
+  `/metrics`(connections·rooms·loop_lag_ms) + 주기 모니터 로깅(가벼운 형태). README에 uvloop
+  (운영 Linux, `--loop uvloop --workers 1`)·FD 상한(`ulimit -n 65536`)·단일 프로세스 필수 명시.
+- **의존성·설정:** `redis==5.2.1`(운영), `fakeredis==2.26.2`·`pytest-asyncio==0.24.0`(개발).
+  README 실행 섹션에 Redis 컨테이너·REDIS_URL·Windows(Docker Desktop+WSL2)·자동 테스트는
+  fakeredis라 Redis 불요 명시.
+- **테스트:** `conftest.py`로 fakeredis 주입(앱·단위 공용 FakeServer, 동기 점검 클라이언트).
+  test_room_store는 async+TTL로 재작성(시간주입 결정론 → TTL 직접 점검). 신규: 재시작 복구,
+  TTL 만료로 입장 거절, retired TTL·재사용 거절, touch TTL 슬라이딩, broadcast 부분 실패
+  전달(gather), **짠 핫패스 Redis 상태 I/O 0건(구조적)**. **pytest 51 passed, 회귀 무손상.**
+
+**산출물:** `app/room_store.py`(재작성), `app/main.py`·`app/connection_manager.py`(수정),
+`requirements.txt`·`requirements-dev.txt`·`pytest.ini`·`README.md`(갱신), `tests/conftest.py`·
+`tests/test_broadcast.py`(신규), `tests/test_room_store.py`(재작성), `tests/test_close_expiry.py`·
+`tests/test_cheers.py`·`tests/test_stability.py`(수정).
+
+**마커:**
+- `ASSUMPTION`: retired 코드 TTL(24h)·`REDIS_URL` 기본값·모니터 샘플링 주기(30s)·유휴 TTL 환산.
+- `REVIEW(Redis 운영)`: 재시작 복구 보장하려면 Redis persistence(AOF/RDB) 활성화 필요 — 안
+  켜면 내구성 의미 반감. Redis가 새 의존성이자 단일 박스의 보조 장애점(가용성은 단일 박스 수준).
+- `REVIEW(만료 알림 경로)`: sweep 제거로 유휴 만료 시 연결 소켓에 room_closed(expired) 능동
+  통지가 사라짐(TTL 수동 소멸). 통지 재설계는 별도 작업.
+- `REVIEW(host_token URL 노출)`: 방장 식별 쿼리 파라미터 — 운영 로그 마스킹/첫 메시지 인증 검토.
+- 기존 유지: `UNVERIFIED`(토스 WebView Origin), `REVIEW`(wss·백그라운드 소켓·남용 방지 IP 키).
+
+---
+
+## 누적 상태 (2026-06-24 기준)
+
+- **구현 완료(1차 범위):** F-RT-01·03·04·05·06 필수 + F-RT-07 기본. 방장 명시적 leave 종료
+  (F-RT-06) + 운영 내구성(Redis 상태 저장소·TTL 만료) + 단일 박스 튜닝.
+- **테스트:** 51 passed (단위·통합·안정성·내구성). 자동 테스트는 fakeredis로 Redis 서버 불요.
+- **미해소(머지·배포 금지):** 모든 검수 마커가 `ai:` 커밋 상태로 사람 검수(S4) 전. 실기기 의존
+  4항목(Origin·지연·백그라운드·wss 재확인) + Redis 운영(persistence·가용성)·만료 통지 재설계.
 - **다음 게이트:** 사람 실기기 검증 → S4 검수(마커 해소·UX 자연성) → S5 배포.
