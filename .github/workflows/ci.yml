@@ -1,0 +1,22 @@
+name: CI
+
+# 푸시·PR마다 자동 검증(pytest). 사람 검수 게이트 앞단의 '자동 게이트'.
+#   pytest는 fakeredis(인메모리)로 돌아 Redis 컨테이너 없이 통과 → CI에서 외부 서비스 불필요.
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    name: pytest
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+      - name: install deps
+        run: pip install -r requirements.txt -r requirements-dev.txt
+      - name: unit/integration tests (pytest · fakeredis)
+        run: python -m pytest -q
