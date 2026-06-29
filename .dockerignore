@@ -1,0 +1,10 @@
+.git
+.pytest_cache
+.venv
+__pycache__
+*.pyc
+dump.rdb
+docs
+prompts
+tests
+requirements-dev.txt

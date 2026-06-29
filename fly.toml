@@ -1,0 +1,30 @@
+# REVIEW(배포 app name): Fly 앱 이름은 전역 유니크하며 확보 후 프론트 VITE_RT_SERVER_URL과 일치해야 한다.
+app = "phonesul-server"
+primary_region = "nrt"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  PORT = "8000"
+
+[http_service]
+  internal_port = 8000
+  force_https = true
+  auto_stop_machines = false
+  auto_start_machines = true
+  # REVIEW(single websocket process): ConnectionManager is process-local, so keep one machine until Redis pub/sub is added.
+  min_machines_running = 0
+  processes = ["app"]
+
+  [[http_service.checks]]
+    interval = "15s"
+    timeout = "2s"
+    grace_period = "10s"
+    method = "GET"
+    path = "/health"
+
+[[vm]]
+  memory = "512mb"
+  cpu_kind = "shared"
+  cpus = 1
