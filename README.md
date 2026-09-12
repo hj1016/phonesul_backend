@@ -35,10 +35,11 @@ FastAPI · WebSocket 백엔드입니다.
 
 ## 담당 역할
 
-**Team Leader | Client Direction & Backend Development**
+**Project Lead (전체 팀장) | Client Direction & Human Review**
 
-- 팀장으로서 클라이언트 기능 범위, 사용자 흐름과 개발 우선순위 조율
-- 클라이언트 구현 방향을 중심으로 팀 의사결정과 결과물 검수
+- 전체 팀장으로서 서비스 방향, 개발 우선순위와 클라이언트 및 백엔드 협업 조율
+- 클라이언트 기능 범위와 사용자 흐름을 중심으로 구현 방향 결정 및 결과물 검수
+- AI 에이전트 개발 플로우에서 코드 변경을 검토하고 사람이 승인하는 단계 담당
 - FastAPI와 WebSocket 기반 실시간 건배방 서버 설계 및 구현 참여
 - Redis 상태 저장소와 TTL 정책을 도입해 서버 재시작 내구성 보강
 - 동시 broadcast, 방장 권한, 만료·재연결·남용 방지 예외 흐름 검증
