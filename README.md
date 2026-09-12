@@ -35,16 +35,15 @@ FastAPI · WebSocket 백엔드입니다.
 
 ## 담당 역할
 
-**Team Leader · Backend / AI Workflow Orchestration**
+**Team Leader | Client Direction & Backend Development**
 
-- 팀 목표와 개발 단계, 사람 검수 게이트를 포함한 AI 협업 프로세스 설계
-- FastAPI·WebSocket 기반 실시간 건배방 서버 설계 및 구현 검수
+- 팀장으로서 클라이언트 기능 범위, 사용자 흐름과 개발 우선순위 조율
+- 클라이언트 구현 방향을 중심으로 팀 의사결정과 결과물 검수
+- FastAPI와 WebSocket 기반 실시간 건배방 서버 설계 및 구현 참여
 - Redis 상태 저장소와 TTL 정책을 도입해 서버 재시작 내구성 보강
 - 동시 broadcast, 방장 권한, 만료·재연결·남용 방지 예외 흐름 검증
 - `pytest` 51개 자동 테스트와 GitHub Actions CI 구성
 - Docker 및 Fly.io 배포 환경 구성
-
-커밋의 `ai:`와 `review:`를 분리해 AI 생성 결과가 사람의 검수 없이 배포되지 않도록 관리했습니다.
 
 ## 시스템 구성
 
